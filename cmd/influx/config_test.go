@@ -19,7 +19,7 @@ func TestCmdConfig(t *testing.T) {
 		tests := []struct {
 			name     string
 			original config.Configs
-			expected config.Configs
+			expected config.Config
 			flags    []string
 		}{
 			{
@@ -32,13 +32,12 @@ func TestCmdConfig(t *testing.T) {
 					"--active",
 				},
 				original: make(config.Configs),
-				expected: config.Configs{
-					"default": {
-						Org:    "org1",
-						Active: true,
-						Token:  "tok1",
-						Host:   "http://localhost:9999",
-					},
+				expected: config.Config{
+					Name:   "default",
+					Org:    "org1",
+					Active: true,
+					Token:  "tok1",
+					Host:   "http://localhost:9999",
 				},
 			},
 			{
@@ -51,28 +50,50 @@ func TestCmdConfig(t *testing.T) {
 					"-a",
 				},
 				original: make(config.Configs),
-				expected: config.Configs{
-					"default": {
+				expected: config.Config{
+					Name:   "default",
+					Org:    "org1",
+					Active: true,
+					Token:  "tok1",
+					Host:   "http://localhost:9999",
+				},
+			},
+			{
+				name: "short new with existing",
+				flags: []string{
+					"-n", "default",
+					"-o", "org1",
+					"-u", "http://localhost:9999",
+					"-t", "tok1",
+					"-a",
+				},
+				original: config.Configs{
+					"config1": {
 						Org:    "org1",
 						Active: true,
 						Token:  "tok1",
-						Host:   "http://localhost:9999",
+						Host:   "host1",
 					},
+				},
+				expected: config.Config{
+					Name:   "default",
+					Org:    "org1",
+					Active: true,
+					Token:  "tok1",
+					Host:   "http://localhost:9999",
 				},
 			},
 		}
-		cmdFn := func(orginal, expected config.Configs) func(*globalFlags, genericCLIOpts) *cobra.Command {
+		cmdFn := func(original config.Configs, expected config.Config) func(*globalFlags, genericCLIOpts) *cobra.Command {
 			svc := &config.MockConfigService{
-				ParseConfigsFn: func() (config.Configs, error) {
-					return orginal, nil
-				},
-				WriteConfigsFn: func(pp config.Configs) error {
-					if diff := cmp.Diff(expected, pp); diff != "" {
-						return &influxdb.Error{
-							Msg: fmt.Sprintf("write configs failed, diff %s", diff),
+				CreateConfigFn: func(cfg config.Config) (config.Config, error) {
+					cfg.Active = true
+					if diff := cmp.Diff(expected, cfg); diff != "" {
+						return config.Config{}, &influxdb.Error{
+							Msg: fmt.Sprintf("create config failed, diff %s", diff),
 						}
 					}
-					return nil
+					return expected, nil
 				},
 			}
 
@@ -103,7 +124,7 @@ func TestCmdConfig(t *testing.T) {
 		tests := []struct {
 			name     string
 			original config.Configs
-			expected config.Configs
+			expected config.Config
 			arg      string
 		}{
 			{
@@ -111,46 +132,77 @@ func TestCmdConfig(t *testing.T) {
 				arg:  "default",
 				original: config.Configs{
 					"config1": {
+						Name:   "config1",
 						Org:    "org2",
 						Active: true,
 						Token:  "tok2",
 						Host:   "http://localhost:8888",
 					},
 					"default": {
+						Name:   "default",
 						Org:    "org1",
 						Active: false,
 						Token:  "tok1",
 						Host:   "http://localhost:9999",
 					},
 				},
-				expected: config.Configs{
+				expected: config.Config{
+					Name:   "default",
+					Org:    "org1",
+					Active: true,
+					Token:  "tok1",
+					Host:   "http://localhost:9999",
+				},
+			},
+			{
+				name: "back",
+				arg:  "-",
+				original: config.Configs{
 					"config1": {
+						Name:   "config1",
 						Org:    "org2",
-						Active: false,
+						Active: true,
 						Token:  "tok2",
 						Host:   "http://localhost:8888",
 					},
 					"default": {
-						Org:    "org1",
-						Active: true,
-						Token:  "tok1",
-						Host:   "http://localhost:9999",
+						Name:           "default",
+						Org:            "org1",
+						Active:         false,
+						PreviousActive: true,
+						Token:          "tok1",
+						Host:           "http://localhost:9999",
 					},
+				},
+				expected: config.Config{
+					Name:   "default",
+					Org:    "org1",
+					Active: true,
+					Token:  "tok1",
+					Host:   "http://localhost:9999",
 				},
 			},
 		}
-		cmdFn := func(orginal, expected config.Configs) func(*globalFlags, genericCLIOpts) *cobra.Command {
+		cmdFn := func(original config.Configs, expected config.Config) func(*globalFlags, genericCLIOpts) *cobra.Command {
 			svc := &config.MockConfigService{
-				ParseConfigsFn: func() (config.Configs, error) {
-					return orginal, nil
-				},
-				WriteConfigsFn: func(pp config.Configs) error {
-					if diff := cmp.Diff(expected, pp); diff != "" {
-						return &influxdb.Error{
-							Msg: fmt.Sprintf("write configs failed, diff %s", diff),
+				SwitchConfigFn: func(name string) (config.Config, error) {
+					var cfg config.Config
+					for _, item := range original {
+						if name == "-" && item.PreviousActive ||
+							item.Name == name {
+							cfg = item
+							break
+
 						}
 					}
-					return nil
+					cfg.Active = true
+					cfg.PreviousActive = false
+					if diff := cmp.Diff(expected, cfg); diff != "" {
+						return config.Config{}, &influxdb.Error{
+							Msg: fmt.Sprintf("switch config failed, diff %s", diff),
+						}
+					}
+					return expected, nil
 				},
 			}
 
@@ -181,7 +233,7 @@ func TestCmdConfig(t *testing.T) {
 		tests := []struct {
 			name     string
 			original config.Configs
-			expected config.Configs
+			expected config.Config
 			flags    []string
 		}{
 			{
@@ -201,13 +253,12 @@ func TestCmdConfig(t *testing.T) {
 						Host:   "http://localhost:8888",
 					},
 				},
-				expected: config.Configs{
-					"default": {
-						Org:    "org1",
-						Active: true,
-						Token:  "tok1",
-						Host:   "http://localhost:9999",
-					},
+				expected: config.Config{
+					Name:   "default",
+					Org:    "org1",
+					Active: true,
+					Token:  "tok1",
+					Host:   "http://localhost:9999",
 				},
 			},
 			{
@@ -227,28 +278,24 @@ func TestCmdConfig(t *testing.T) {
 						Host:   "http://localhost:8888",
 					},
 				},
-				expected: config.Configs{
-					"default": {
-						Org:    "org1",
-						Active: true,
-						Token:  "tok1",
-						Host:   "http://localhost:9999",
-					},
+				expected: config.Config{
+					Name:   "default",
+					Org:    "org1",
+					Active: true,
+					Token:  "tok1",
+					Host:   "http://localhost:9999",
 				},
 			},
 		}
-		cmdFn := func(orginal, expected config.Configs) func(*globalFlags, genericCLIOpts) *cobra.Command {
+		cmdFn := func(original config.Configs, expected config.Config) func(*globalFlags, genericCLIOpts) *cobra.Command {
 			svc := &config.MockConfigService{
-				ParseConfigsFn: func() (config.Configs, error) {
-					return orginal, nil
-				},
-				WriteConfigsFn: func(pp config.Configs) error {
-					if diff := cmp.Diff(expected, pp); diff != "" {
-						return &influxdb.Error{
-							Msg: fmt.Sprintf("write configs failed, diff %s", diff),
+				UpdateConfigFn: func(cfg config.Config) (config.Config, error) {
+					if diff := cmp.Diff(expected, cfg); diff != "" {
+						return config.Config{}, &influxdb.Error{
+							Msg: fmt.Sprintf("update config failed, diff %s", diff),
 						}
 					}
-					return nil
+					return expected, nil
 				},
 			}
 
@@ -279,7 +326,7 @@ func TestCmdConfig(t *testing.T) {
 		tests := []struct {
 			name     string
 			original config.Configs
-			expected config.Configs
+			expected config.Config
 			flags    []string
 		}{
 			{
@@ -289,13 +336,20 @@ func TestCmdConfig(t *testing.T) {
 				},
 				original: config.Configs{
 					"default": {
+						Name:   "default",
 						Org:    "org2",
 						Active: false,
 						Token:  "tok2",
 						Host:   "http://localhost:8888",
 					},
 				},
-				expected: make(config.Configs),
+				expected: config.Config{
+					Name:   "default",
+					Org:    "org2",
+					Active: false,
+					Token:  "tok2",
+					Host:   "http://localhost:8888",
+				},
 			},
 			{
 				name: "short",
@@ -304,27 +358,38 @@ func TestCmdConfig(t *testing.T) {
 				},
 				original: config.Configs{
 					"default": {
+						Name:   "default",
 						Org:    "org2",
 						Active: false,
 						Token:  "tok2",
 						Host:   "http://localhost:8888",
 					},
 				},
-				expected: make(config.Configs),
+				expected: config.Config{
+					Name:   "default",
+					Org:    "org2",
+					Active: false,
+					Token:  "tok2",
+					Host:   "http://localhost:8888",
+				},
 			},
 		}
-		cmdFn := func(orginal, expected config.Configs) func(*globalFlags, genericCLIOpts) *cobra.Command {
+		cmdFn := func(original config.Configs, expected config.Config) func(*globalFlags, genericCLIOpts) *cobra.Command {
 			svc := &config.MockConfigService{
-				ParseConfigsFn: func() (config.Configs, error) {
-					return orginal, nil
-				},
-				WriteConfigsFn: func(pp config.Configs) error {
-					if diff := cmp.Diff(expected, pp); diff != "" {
-						return &influxdb.Error{
-							Msg: fmt.Sprintf("write configs failed, diff %s", diff),
+				DeleteConfigFn: func(name string) (config.Config, error) {
+					var cfg config.Config
+					for _, item := range original {
+						if item.Name == name {
+							cfg = item
+							break
 						}
 					}
-					return nil
+					if diff := cmp.Diff(expected, cfg); diff != "" {
+						return config.Config{}, &influxdb.Error{
+							Msg: fmt.Sprintf("delete config failed, diff %s", diff),
+						}
+					}
+					return expected, nil
 				},
 			}
 
@@ -376,7 +441,7 @@ func TestCmdConfig(t *testing.T) {
 		}
 		cmdFn := func(expected config.Configs) func(*globalFlags, genericCLIOpts) *cobra.Command {
 			svc := &config.MockConfigService{
-				ParseConfigsFn: func() (config.Configs, error) {
+				ListConfigsFn: func() (config.Configs, error) {
 					return expected, nil
 				},
 			}
