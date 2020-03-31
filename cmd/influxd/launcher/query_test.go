@@ -8,6 +8,7 @@ import (
 	"io"
 	nethttp "net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/influxdata/influxdb"
 	"github.com/influxdata/influxdb/cmd/influxd/launcher"
 	phttp "github.com/influxdata/influxdb/http"
+	"github.com/influxdata/influxdb/kit/prom"
 	"github.com/influxdata/influxdb/query"
 )
 
@@ -105,28 +107,82 @@ func TestPipeline_WriteV2_Query(t *testing.T) {
 	res.HasTableCount(t, 1)
 }
 
-// This test initializes a default launcher; writes some data; queries the data (success);
-// sets memory limits to the same read query; checks that the query fails because limits are exceeded.
-func TestPipeline_QueryMemoryLimits(t *testing.T) {
-	t.Skip("setting memory limits in the client is not implemented yet")
+func getMemoryUnused(t *testing.T, reg *prom.Registry) int64 {
+	t.Helper()
 
-	l := launcher.RunTestLauncherOrFail(t, ctx)
-	l.SetupOrFail(t)
-	defer l.ShutdownOrFail(t, ctx)
-
-	// write some points
-	for i := 0; i < 100; i++ {
-		l.WritePointsOrFail(t, fmt.Sprintf(`m,k=v1 f=%di %d`, i*100, time.Now().UnixNano()))
+	ms, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
 	}
+	for _, m := range ms {
+		if m.GetName() == "query_control_memory_unused_bytes" {
+			return int64(*m.GetMetric()[0].Gauge.Value)
+		}
+	}
+	t.Errorf("query metric for unused memory not found")
+	return 0
+}
 
-	// compile a from query and get the spec
-	qs := fmt.Sprintf(`from(bucket:"%s") |> range(start:-5m)`, l.Bucket.Name)
+func checkMemoryUsed(t *testing.T, l *launcher.TestLauncher, concurrency, initial int) {
+	t.Helper()
+
+	got := l.QueryController().GetUsedMemoryBytes()
+	// base memory used is equal to initial memory bytes * concurrency.
+	if want := int64(concurrency * initial); want != got {
+		t.Errorf("expected used memory %d, got %d", want, got)
+	}
+}
+
+func writeBytes(t *testing.T, l *launcher.TestLauncher, tagValue string, bs int) int {
+	// every point is:
+	//    1 byte measurement ("m")
+	//  + len(tag) bytes
+	//  + 64 bytes field
+	//  + 64 bytes timestamp
+	//  ---------------------------
+	//  = 129 + len(tag) bytes
+	pointSize := 129 + len(tagValue)
+	if bs < pointSize {
+		bs = pointSize
+	}
+	n := bs / pointSize
+	if n*pointSize < bs {
+		n++
+	}
+	for i := 0; i < n; i++ {
+		l.WritePointsOrFail(t, fmt.Sprintf(`m,t=%s f=%di %d`, tagValue, i*100, time.Now().UnixNano()))
+	}
+	return n * pointSize
+}
+
+type queryOption func(fluxQuery string) string
+
+func withTagValue(tv string) queryOption {
+	return func(fluxQuery string) string {
+		return fmt.Sprintf(`%s
+	|> filter(fn: (r) => r.t == "%s")`, fluxQuery, tv)
+	}
+}
+
+func withSleep(s time.Duration) queryOption {
+	return func(fluxQuery string) string {
+		return fmt.Sprintf(`%s
+	|> sleep(duration: %v)`, fluxQuery, flux.ConvertDuration(s))
+	}
+}
+
+func queryPoints(ctx context.Context, t *testing.T, l *launcher.TestLauncher, opts ...queryOption) error {
+	qs := fmt.Sprintf(`from(bucket:"%s")
+	|> range(start:-5m)
+	// ensure we load everything into memory
+	|> sort(columns: ["_time"])`, l.Bucket.Name)
+	for _, opt := range opts {
+		qs = opt(qs)
+	}
 	pkg, err := flux.Parse(qs)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	// we expect this request to succeed
 	req := &query.Request{
 		Authorization:  l.Auth,
 		OrganizationID: l.Org.ID,
@@ -134,23 +190,254 @@ func TestPipeline_QueryMemoryLimits(t *testing.T) {
 			AST: pkg,
 		},
 	}
-	if err := l.QueryAndNopConsume(context.Background(), req); err != nil {
-		t.Fatal(err)
+	t.Logf("query:\n%s", qs)
+	return l.QueryAndNopConsume(ctx, req)
+}
+
+// This test:
+//  - initializes a default launcher and sets memory limits;
+//  - writes some data;
+//  - queries the data;
+//  - verifies that the query fails (or not) and that the memory was de-allocated.
+func TestPipeline_QueryMemoryLimits(t *testing.T) {
+	tcs := []struct {
+		name           string
+		args           []string
+		err            bool
+		querySizeBytes int
+		// max_memory - per_query_memory * concurrency
+		unusedMemoryBytes int
+	}{
+		{
+			name: "ok - initial memory bytes, memory bytes, and max memory set",
+			args: []string{
+				"--query-concurrency", "1",
+				"--query-initial-memory-bytes", "100",
+				"--query-max-memory-bytes", "1048576", // 1MB
+			},
+			querySizeBytes:    30000,
+			err:               false,
+			unusedMemoryBytes: 1048476,
+		},
+		{
+			name: "error - memory bytes and max memory set",
+			args: []string{
+				"--query-concurrency", "1",
+				"--query-memory-bytes", "1",
+				"--query-max-memory-bytes", "100",
+			},
+			querySizeBytes:    2,
+			err:               true,
+			unusedMemoryBytes: 99,
+		},
+		{
+			name: "error - initial memory bytes and max memory set",
+			args: []string{
+				"--query-concurrency", "1",
+				"--query-initial-memory-bytes", "1",
+				"--query-max-memory-bytes", "100",
+			},
+			querySizeBytes:    101,
+			err:               true,
+			unusedMemoryBytes: 99,
+		},
+		{
+			name: "error - initial memory bytes, memory bytes, and max memory set",
+			args: []string{
+				"--query-concurrency", "1",
+				"--query-initial-memory-bytes", "1",
+				"--query-memory-bytes", "50",
+				"--query-max-memory-bytes", "100",
+			},
+			querySizeBytes:    51,
+			err:               true,
+			unusedMemoryBytes: 99,
+		},
 	}
 
-	// ok, the first request went well, let's add memory limits:
-	// this query should error.
-	// spec.Resources = flux.ResourceManagement{
-	// 	MemoryBytesQuota: 100,
-	// }
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			l := launcher.RunTestLauncherOrFail(t, ctx, tc.args...)
+			l.SetupOrFail(t)
+			defer l.ShutdownOrFail(t, ctx)
 
-	if err := l.QueryAndNopConsume(context.Background(), req); err != nil {
+			const tagValue = "t0"
+			writeBytes(t, l, tagValue, tc.querySizeBytes)
+			if err := queryPoints(context.Background(), t, l, withTagValue(tagValue)); err != nil {
+				if tc.err {
+					if !strings.Contains(err.Error(), "allocation limit reached") {
+						t.Errorf("query errored with unexpected error: %v", err)
+					}
+				} else {
+					t.Errorf("unexpected error: %v", err)
+				}
+			} else if tc.err {
+				t.Errorf("expected error, got successful query execution")
+			}
+
+			reg := l.Registry()
+			got := getMemoryUnused(t, reg)
+			want := int64(tc.unusedMemoryBytes)
+			if want != got {
+				t.Errorf("expected unused memory %d, got %d", want, got)
+			}
+		})
+	}
+}
+
+// This test:
+//  - initializes a default launcher and sets memory limits;
+//  - writes some data;
+//  - launches a query that does not error;
+//  - launches a query that gets canceled while executing;
+//  - launches a query that does not error;
+//  - verifies after each query run the used memory.
+func TestPipeline_QueryMemoryLimits_ExceedMemory(t *testing.T) {
+	l := launcher.RunTestLauncherOrFail(t, ctx,
+		"--log-level", "error",
+		"--query-concurrency", "1",
+		"--query-initial-memory-bytes", "100",
+		"--query-memory-bytes", "50000",
+		"--query-max-memory-bytes", "200000",
+	)
+	l.SetupOrFail(t)
+	defer l.ShutdownOrFail(t, ctx)
+
+	// one tag does not exceed memory.
+	const tOK = "t0"
+	writeBytes(t, l, tOK, 10000)
+	// the other does.
+	const tKO = "t1"
+	writeBytes(t, l, tKO, 50001)
+
+	if err := queryPoints(context.Background(), t, l, withTagValue(tOK)); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	checkMemoryUsed(t, l, 1, 100)
+	if err := queryPoints(context.Background(), t, l, withTagValue(tKO)); err != nil {
 		if !strings.Contains(err.Error(), "allocation limit reached") {
-			t.Fatalf("query errored with unexpected error: %v", err)
+			t.Errorf("query errored with unexpected error: %v", err)
 		}
 	} else {
-		t.Fatal("expected error, got successful query execution")
+		t.Errorf("unexpected error: %v", err)
 	}
+	checkMemoryUsed(t, l, 1, 100)
+	if err := queryPoints(context.Background(), t, l, withTagValue(tOK)); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	checkMemoryUsed(t, l, 1, 100)
+}
+
+// This test:
+//  - initializes a default launcher and sets memory limits;
+//  - writes some data;
+//  - launches a query that does not error;
+//  - launches a query and cancels its context;
+//  - launches a query that does not error;
+//  - verifies after each query run the used memory.
+func TestPipeline_QueryMemoryLimits_ContextCanceled(t *testing.T) {
+	l := launcher.RunTestLauncherOrFail(t, ctx,
+		"--log-level", "error",
+		"--query-concurrency", "1",
+		"--query-initial-memory-bytes", "100",
+		"--query-memory-bytes", "50000",
+		"--query-max-memory-bytes", "200000",
+	)
+	l.SetupOrFail(t)
+	defer l.ShutdownOrFail(t, ctx)
+
+	const tag = "t0"
+	writeBytes(t, l, tag, 10000)
+
+	if err := queryPoints(context.Background(), t, l, withTagValue(tag)); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	checkMemoryUsed(t, l, 1, 100)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := queryPoints(ctx, t, l, withSleep(4*time.Second)); err == nil {
+		t.Errorf("expected error got none")
+	}
+	checkMemoryUsed(t, l, 1, 100)
+	if err := queryPoints(context.Background(), t, l, withTagValue(tag)); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	checkMemoryUsed(t, l, 1, 100)
+}
+
+// This test:
+//  - initializes a default launcher and sets memory limits;
+//  - writes some data;
+//  - launches several queries that may exceed the memory limit;
+//  - verifies after each query run the used memory.
+func TestPipeline_QueryMemoryLimits_ConcurrentQueries(t *testing.T) {
+	l := launcher.RunTestLauncherOrFail(t, ctx,
+		"--log-level", "error",
+		"--query-queue-size", "1024",
+		"--query-concurrency", "1",
+		"--query-initial-memory-bytes", "100",
+		"--query-memory-bytes", "50000",
+		"--query-max-memory-bytes", "200000",
+	)
+	l.SetupOrFail(t)
+	defer l.ShutdownOrFail(t, ctx)
+
+	// one tag does not exceed memory.
+	const tSmall = "t0"
+	writeBytes(t, l, tSmall, 10000)
+	// the other does.
+	const tBig = "t1"
+	writeBytes(t, l, tBig, 100000)
+
+	const nOK = 100
+	const nMemExceeded = 100
+	const nContextCanceled = 100
+	wg := sync.WaitGroup{}
+	// Flock of OK queries.
+	wg.Add(nOK)
+	for i := 0; i < nOK; i++ {
+		i := i
+		go func() {
+			if err := queryPoints(context.Background(), t, l, withTagValue(tSmall)); err != nil {
+				t.Errorf("unexpected error (query %d): %v", i, err)
+			}
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+	checkMemoryUsed(t, l, 1, 100)
+	// Flock of big queries.
+	wg.Add(nMemExceeded)
+	for i := 0; i < nMemExceeded; i++ {
+		i := i
+		go func() {
+			if err := queryPoints(context.Background(), t, l, withTagValue(tBig)); err == nil {
+				t.Errorf("expected error got none (query %d)", i)
+			} else if !strings.Contains(err.Error(), "allocation limit reached") {
+				t.Errorf("got wrong error (query %d): %v", i, err)
+			}
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+	checkMemoryUsed(t, l, 1, 100)
+	// Flock of context canceled queries
+	wg.Add(nContextCanceled)
+	for i := 0; i < nContextCanceled; i++ {
+		i := i
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if err := queryPoints(ctx, t, l, withTagValue(tSmall), withSleep(4*time.Second)); err == nil {
+				t.Errorf("expected error got none (query %d)", i)
+			} else if !strings.Contains(err.Error(), "context") {
+				t.Errorf("got wrong error (query %d): %v", i, err)
+			}
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+	checkMemoryUsed(t, l, 1, 100)
 }
 
 func TestPipeline_Query_LoadSecret_Success(t *testing.T) {

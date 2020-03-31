@@ -83,7 +83,16 @@ func (tl *TestLauncher) Run(ctx context.Context, args ...string) error {
 	args = append(args, "--bolt-path", filepath.Join(tl.Path, bolt.DefaultFilename))
 	args = append(args, "--engine-path", filepath.Join(tl.Path, "engine"))
 	args = append(args, "--http-bind-address", "127.0.0.1:0")
-	args = append(args, "--log-level", "debug")
+	logLevel := false
+	for _, arg := range args {
+		if arg == "--log-level" {
+			logLevel = true
+			break
+		}
+	}
+	if !logLevel {
+		args = append(args, "--log-level", "debug")
+	}
 	return tl.Launcher.Run(ctx, args...)
 }
 
