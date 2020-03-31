@@ -83,8 +83,8 @@ func TestService(t *testing.T) {
 					require.Len(t, diff.Buckets, 2)
 
 					expected := DiffBucket{
-						ID:   SafeID(1),
-						Name: "rucket_11",
+						ID:      SafeID(1),
+						PkgName: "rucket_11",
 						Old: &DiffBucketValues{
 							Description:    "old desc",
 							RetentionRules: retentionRules{newRetentionRule(30 * time.Hour)},
@@ -112,7 +112,7 @@ func TestService(t *testing.T) {
 					require.Len(t, diff.Buckets, 2)
 
 					expected := DiffBucket{
-						Name: "rucket_11",
+						PkgName: "rucket_11",
 						New: DiffBucketValues{
 							Description:    "bucket 1 description",
 							RetentionRules: retentionRules{newRetentionRule(time.Hour)},
