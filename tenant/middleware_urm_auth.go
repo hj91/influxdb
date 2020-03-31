@@ -7,10 +7,6 @@ import (
 	"github.com/influxdata/influxdb/authorizer"
 )
 
-type OrgUrmService interface {
-	FindResourceOrganizationID(ctx context.Context, rt influxdb.ResourceType, id influxdb.ID) (influxdb.ID, error)
-}
-
 type AuthedURMService struct {
 	s          influxdb.UserResourceMappingService
 	orgService OrgUrmService
@@ -32,31 +28,44 @@ func (s *AuthedURMService) FindUserResourceMappings(ctx context.Context, filter 
 }
 
 func (s *AuthedURMService) CreateUserResourceMapping(ctx context.Context, m *influxdb.UserResourceMapping) error {
-	orgID, err := s.orgService.FindResourceOrganizationID(ctx, m.ResourceType, m.ResourceID)
-	if err != nil {
-		return err
+	orgID := orgIDFromContext(ctx)
+	if orgID != nil {
+		if _, _, err := authorizer.AuthorizeWrite(ctx, m.ResourceType, m.ResourceID, *orgID); err != nil {
+			return err
+		}
+	} else {
+		if _, _, err := authorizer.AuthorizeWriteResource(ctx, m.ResourceType, m.ResourceID); err != nil {
+			return err
+		}
 	}
-	if _, _, err := authorizer.AuthorizeWrite(ctx, m.ResourceType, m.ResourceID, orgID); err != nil {
-		return err
-	}
+
 	return s.s.CreateUserResourceMapping(ctx, m)
 }
 
 func (s *AuthedURMService) DeleteUserResourceMapping(ctx context.Context, resourceID influxdb.ID, userID influxdb.ID) error {
+	if !resourceID.Valid() || !userID.Valid() {
+		return ErrInvalidURMID
+	}
+
 	f := influxdb.UserResourceMappingFilter{ResourceID: resourceID, UserID: userID}
 	urms, _, err := s.s.FindUserResourceMappings(ctx, f)
 	if err != nil {
 		return err
 	}
 
+	// There should only be one because resourceID and userID are used to create the primary key for urms
 	for _, urm := range urms {
-		orgID, err := s.orgService.FindResourceOrganizationID(ctx, urm.ResourceType, urm.ResourceID)
-		if err != nil {
-			return err
+		orgID := orgIDFromContext(ctx)
+		if orgID != nil {
+			if _, _, err := authorizer.AuthorizeWrite(ctx, urm.ResourceType, urm.ResourceID, *orgID); err != nil {
+				return err
+			}
+		} else {
+			if _, _, err := authorizer.AuthorizeWriteResource(ctx, urm.ResourceType, urm.ResourceID); err != nil {
+				return err
+			}
 		}
-		if _, _, err := authorizer.AuthorizeWrite(ctx, urm.ResourceType, urm.ResourceID, orgID); err != nil {
-			return err
-		}
+
 		if err := s.s.DeleteUserResourceMapping(ctx, urm.ResourceID, urm.UserID); err != nil {
 			return err
 		}

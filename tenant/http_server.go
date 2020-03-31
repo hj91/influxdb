@@ -1,12 +1,19 @@
 package tenant
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strconv"
 
+	"github.com/go-chi/chi"
 	"github.com/influxdata/influxdb"
+	"github.com/influxdata/influxdb/kit"
 )
+
+type tenantContext string
+
+const ctxOrgKey tenantContext = "orgID"
 
 // findOptionsParams converts find options into a paramiterizated key pair
 func findOptionParams(opts ...influxdb.FindOptions) [][2]string {
@@ -76,4 +83,37 @@ func decodeFindOptions(r *http.Request) (*influxdb.FindOptions, error) {
 	}
 
 	return opts, nil
+}
+
+// ValidResource make sure a resource exists when a sub system needs to be mounted to an api
+func ValidResource(api *kit.Api, lookupOrgByResourceID func(ctx context.Context, influxdb.ID) (influxdb.ID, error)) kit.Middleware {
+	return func(next http.Handler) http.Handler {
+		fn := func(w http.ResponseWriter, r *http.Request) {
+			// get the id from the chi
+			id, err := influxdb.IDFromString(chi.URLParam(r, "id"))
+			if err != nil {
+				api.Err(w, ErrCorruptID(err))
+				return
+			}
+
+			ctx := r.Context()
+
+			orgID, err := lookupOrgByResourceID(ctx, id)
+			if err != nil {
+				api.Err(w, err)
+				return
+			}
+
+			next.ServeHTTP(statusW, r.WithContext(context.WithValue(ctx, ctxOrgKey, orgID)))
+		}
+		return http.HandlerFunc(fn)
+	}
+}
+
+func orgIDFromContext(ctx context.Context) *influxdb.ID {
+	v := ctx.Value(ctxOrgKey)
+	if v == nil {
+		return nil
+	}
+	return &v.(influxdb.ID)
 }

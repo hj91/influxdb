@@ -24,6 +24,11 @@ var (
 		Code: influxdb.EInternal,
 		Msg:  "unable to generate valid id",
 	}
+
+	ErrNotFound = &influxdb.Error{
+		Code: influxdb.ENotFound,
+		Msg:  "not found",
+	}
 )
 
 // ErrCorruptID the ID stored in the Store is corrupt.
